@@ -1,0 +1,15 @@
+@startuml
+'https://plantuml.com/component-diagram
+
+[Syfter]
+database matrix{
+}
+queue kafka{
+}
+node "Syfter Consumer"{
+kafka->matrix
+}
+
+
+
+@enduml
