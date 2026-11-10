@@ -24,7 +24,7 @@
 
 
 
-![Alt Text](/drawDiagram/Capture1.JPG)
+![Alt Text](drawDiagram/Capture1.JPG)
 
 It consists of three core microservices, the Product, Review, and Recommendation services,
 all of which deal with one type of resource, and a composite microservice

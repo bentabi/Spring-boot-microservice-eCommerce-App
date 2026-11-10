@@ -10,4 +10,4 @@ The programming model is functional paradigm (`Supplier, Function/Consumer`).
 
 
 
-![Alt Text](/drawDiagram/CaptureE1.JPG)
+![Alt Text](drawDiagram/CaptureE1.JPG)

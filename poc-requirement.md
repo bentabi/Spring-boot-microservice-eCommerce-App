@@ -51,7 +51,7 @@ Flow #1 – LEVEL 0
 
 	Postman– API verification
 
-![alt text](/drawDiagram/Capture2.JPG)
+![alt text](drawDiagram/Capture2.JPG)
 
 
 #### PROJECT SCOPE – LEVEL 1
@@ -81,5 +81,5 @@ Flow #2 – LEVEL 1
 	
 	Login to registered account 
 
-![alt_text](/drawDiagram/Capture3.JPG)
+![alt_text](drawDiagram/Capture3.JPG)
 

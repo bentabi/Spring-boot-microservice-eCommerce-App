@@ -1,5 +1,4 @@
 # Developing Event Driven Asynchronous services
-![Alt Text](/drawDiagram/CaptureE1.JPG)
 ![Alt Text](CaptureE1.JPG)
 This programming model can be used independently of the messaging system used, for example, RabbitMQ or Apache Kafka!
 
