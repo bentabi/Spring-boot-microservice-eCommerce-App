@@ -1,0 +1,64 @@
+@startuml
+'https://plantuml.com/activity-diagram-beta
+
+start
+    split
+        :Matrix;
+        split
+        start
+            :Matrix.UI;
+            :Disply KPI result;
+        stop
+        split again
+            :Matrix.DeviceonBoard;
+        end split
+    split
+    split again
+        :Matrix.Associate SyfterId;
+        start
+        :update DB;
+        end;
+    end split
+    split again
+    :Syfter;
+        split
+        :Event Bus Kafka;
+        :Consumes device data
+           and update node_node;
+
+        stop
+        split again
+
+        :Prepares Generic Model Nuggets
+        (KPI,Inventory,Alarm);
+        end split
+        :Schedule the Nuggets to publish on
+        Multiple generic topics;
+        :Poll engine starts polling;
+        split
+            :Inventory;
+        split again
+            :KPI;
+        split again
+            :Alarm;
+        end split
+    split again
+    :SyfterConsumer;
+        :Consumes Data from Event Bus Kafka;
+        split
+            :Inventory;
+            :Insert/update node_node;
+        split again
+            :KPI;
+            :Insert/Update kpi;
+        split again
+            :Alarm;
+            :Insert/Update Fault;
+        end split
+    stop;
+    end split;
+        :Event Bus Kafka;
+stop;
+
+
+@enduml

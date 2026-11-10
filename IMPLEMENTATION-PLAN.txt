@@ -1,0 +1,526 @@
+===============================================================================
+ HCL GADGETS - IMPLEMENTATION PLAN
+ Cart + Stripe Checkout -> Kafka -> EKS -> Grafana -> LinkedIn showcase
+===============================================================================
+ Drafted: 2026-07-21
+ Repo:    D:\cns-romania-readme-main
+ Status:  PLAN ONLY - no implementation started, decisions still open (see S9)
+===============================================================================
+
+
+-------------------------------------------------------------------------------
+ S1. WHERE THE PROJECT STANDS TODAY
+-------------------------------------------------------------------------------
+
+BACKEND - Spring Boot 2.7.1, Gradle multi-module, sourceCompatibility 1.8
+
+  MODULE                       STATE
+  ---------------------------  ----------------------------------------------
+  api                          Shared DTOs + exceptions                  DONE
+  util                         ServiceUtil, global exception handler     DONE
+  product-service              MongoDB, full CRUD, mapper, tests         DONE
+  recommendation-service       MongoDB, full CRUD                        DONE
+  review-service               MySQL/JPA, full CRUD                      DONE
+  product-composite-service    Aggregator, SYNCHRONOUS blocking calls,
+                               springdoc OpenAPI                         DONE
+
+FRONTEND - vanilla TypeScript + Vite (no framework)
+  Hash router: list / search / detail / create
+  Inline add + delete for reviews and recommendations
+  Proxies /product-composite via vite.config.ts (no CORS config needed)
+
+INFRA - docker-compose.yml
+  4 microservices + MongoDB + MySQL + adminer + mongo-express
+
+
+WHAT IS MISSING  (these break assumptions in the original EKS plan)
+
+  1. NOT A GIT REPOSITORY. No .git directory exists. The original plan's
+     step "clone your GitHub repo to local" has nothing to clone.
+     >> This is the first thing that must be fixed.
+
+  2. /actuator/prometheus DOES NOT EXIST. No micrometer-registry-prometheus
+     dependency in any build.gradle. Actuator is present but only exposes
+     default endpoints. Prometheus would have nothing to scrape.
+
+  3. KAFKA IS DOCUMENTATION ONLY. event-driven-asynchronus.md describes the
+     design and api/.../EventProcessingException.java exists, but there is:
+       - no spring-cloud-stream dependency
+       - no Event class
+       - no broker in docker-compose
+     Composite create/delete are synchronous today.
+
+  4. NO USER-SERVICE. poc-requirement.md Level 0 (register / login / get user)
+     was never built. Level 1 is therefore partial.
+
+  5. NO GATEWAY / EDGE SERVER, no service discovery, no config server.
+     Composite hardcodes hostnames per Spring profile. Kubernetes gives DNS
+     for free, but the frontend still needs one public entry point.
+
+  6. DOCKERFILES USE adoptopenjdk:16_36-jre-hotspot - deprecated and
+     unmaintained. Must be replaced before pushing to ECR.
+
+  7. SCOPE MISMATCH. "Deploy Your Payment App" is really 6-7 services plus
+     2 databases plus Kafka. The original Phase 2 is scoped for one app.
+
+
+-------------------------------------------------------------------------------
+ S2. THE ONE BIG CHANGE TO THE ORIGINAL PLAN
+-------------------------------------------------------------------------------
+
+  DO NOT PUT EKS FIRST.
+
+  The original ordering (Phase 1 = EKS cluster) means debugging Stripe
+  webhooks and Kafka wiring inside a cloud cluster - slow feedback loops,
+  kubectl logs instead of a local debugger, and the cluster billing the
+  whole time.
+
+  REVISED ORDER:
+    app -> local Kafka -> local Stripe -> local Grafana -> THEN EKS
+
+  Grafana dashboards built locally port to EKS unchanged (export the JSON).
+
+  REALISTIC TOTAL: 5-7 working days.
+  The original table implied ~4.5 hours. Its per-step times are reasonable
+  for the steps as written - there are simply many more steps than it counts.
+
+
+-------------------------------------------------------------------------------
+ S3. TRACK 0 - FOUNDATION            (~2 hours)   BLOCKS EVERYTHING
+-------------------------------------------------------------------------------
+
+  0.1  git init
+       Write .gitignore FIRST, covering:
+         build/  bin/  .gradle/  .settings/  .idea/  *.iml
+         node_modules/  backend.zip  .env  .env.*
+       Then git add . and push to GitHub.
+
+       !! Commit .gitignore BEFORE the first `git add .`
+          backend.zip is 1.7 MB and the build/ dirs are large. Once they are
+          in history, removing them needs a filter-branch/filter-repo rewrite.
+
+  0.2  Replace deprecated base image in all 4 Dockerfiles:
+         adoptopenjdk:16_36-jre-hotspot  ->  eclipse-temurin:17-jre
+       Bump sourceCompatibility 1.8 -> 17 in each build.gradle.
+       Spring Boot 2.7 runs fine on Java 17; no code changes required.
+
+  0.3  Add to EVERY service build.gradle:
+         implementation 'io.micrometer:micrometer-registry-prometheus'
+       And in each application.yml:
+         management.endpoints.web.exposure.include: health,info,prometheus,metrics
+         management.metrics.tags.service: ${spring.application.name}
+
+       The `service` tag is what makes the Grafana template variable work
+       later. Add it now, not retroactively.
+
+  0.4  Verify: docker-compose up still green,
+       curl localhost:PORT/actuator/prometheus returns metrics.
+
+
+-------------------------------------------------------------------------------
+ S4. TRACK 1 - KAFKA + EVENT-DRIVEN REFACTOR      (~1 day)
+-------------------------------------------------------------------------------
+
+  Delivers what event-driven-asynchronus.md already promised, and is the
+  foundation the checkout flow rides on.
+
+  1.1  Add Kafka to docker-compose.yml (KRaft mode, no Zookeeper needed).
+  1.2  Add spring-cloud-stream-binder-kafka.
+       !! Pin Spring Cloud release train 2021.0.x - that is the line
+          compatible with Boot 2.7. Later trains require Boot 3.x.
+  1.3  Create Event<K,T> in the api module:
+         type (CREATE | DELETE), key, data, eventCreatedAt
+  1.4  Composite becomes PRODUCER: publishes to topics `products`,
+       `recommendations`, `reviews`; returns 202 Accepted immediately.
+  1.5  Each core service becomes CONSUMER: Consumer<Event<...>> bean.
+  1.6  Configure consumer groups, partitions, retry, dead-letter queue.
+  1.7  Update test-em-all.bash for async - poll for eventual consistency
+       rather than asserting immediately after POST.
+
+  !! BREAKING BEHAVIOUR CHANGE
+     Create/delete become eventually consistent. The frontend currently
+     calls renderDetail(id) immediately after a POST (see main.ts) - that
+     will race and show stale data. Fix with a short refetch delay or
+     optimistic UI update.
+
+
+-------------------------------------------------------------------------------
+ S5. TRACK 2 - CART + CHECKOUT + STRIPE           (~2 days)
+-------------------------------------------------------------------------------
+
+RECOMMENDED SHAPE - 2 new services, not 3:
+
+  * CART LIVES IN localStorage on the frontend. No cart-service.
+    This is what real e-commerce commonly does for anonymous shoppers,
+    removes an entire service, and sidesteps the missing user-service.
+
+  * order-service   (MySQL)  - POST /orders takes the cart snapshot,
+                               writes order in PENDING, returns orderId.
+                               GET /orders/{id} for the status page.
+
+  * payment-service          - Stripe integration, owns the webhook endpoint.
+
+THE EVENT FLOW (the part worth showing on LinkedIn):
+
+  Frontend cart
+     -> POST /orders          order-service writes order = PENDING
+     -> kafka: order.created
+     -> payment-service       creates Stripe Checkout Session
+     -> redirect              customer lands on Stripe hosted page
+     -> Stripe webhook        payment-service verifies signature
+     -> kafka: payment.succeeded
+     -> order-service         marks order = PAID
+     -> product-service       decrements countInStock
+
+STEPS
+
+  2.1  order-service: entity, repository, POST /orders, GET /orders/{id},
+       Kafka producer for order.created
+  2.2  payment-service: Stripe Java SDK, create Checkout Session,
+       POST /webhook with signature verification
+  2.3  Kafka topics: order.created, payment.succeeded, payment.failed
+  2.4  product-service consumes payment.succeeded -> decrement stock
+  2.5  Frontend: cart page, add-to-cart button, checkout redirect,
+       success/cancel return routes, order status page
+  2.6  Local Stripe testing via Stripe CLI (see S6)
+  2.7  Micrometer instrumentation (see S7) - NOT optional, this is what
+       makes the Grafana dashboard have anything to show
+
+DESIGN DECISIONS
+
+  !! USE STRIPE CHECKOUT (hosted page), NOT Payment Intents + Elements.
+     You never touch card data -> no PCI surface. ~30 lines instead of a
+     full frontend card form. For a portfolio piece it reads MORE
+     professional, not less.
+
+  !! AMOUNTS ARE INTEGER MINOR UNITS. Stripe wants cents: $19.99 = 1999.
+     Getting this wrong by 100x is the single most common Stripe bug.
+     Unit-test the conversion.
+
+  !! SECRETS: Stripe secret key + webhook signing secret go in .env,
+     gitignored from the very first commit (see 0.1).
+
+
+-------------------------------------------------------------------------------
+ S6. TESTING THE PAYMENT SYSTEM
+-------------------------------------------------------------------------------
+
+  ****  NEVER USE A REAL CREDIT CARD. NOT AT ANY POINT.  ****
+
+  Stripe test mode is a completely separate universe from live mode:
+  separate API keys, separate dashboard, separate data. No real money can
+  move. A real card submitted in test mode is REJECTED by Stripe; a test
+  card in live mode is likewise rejected. The two modes cannot touch.
+
+TEST CARDS
+  Any future expiry, any 3-digit CVC, any postal code.
+  The NUMBER selects the outcome:
+
+    4242 4242 4242 4242   Successful payment (happy path)
+    4000 0000 0000 0002   Generic decline
+    4000 0000 0000 9995   Decline - insufficient funds
+    4000 0000 0000 0069   Decline - expired card
+    4000 0025 0000 3155   Requires 3D Secure authentication
+    4000 0000 0000 0119   Processing error on Stripe's side
+
+  !! Verify these against Stripe's current testing docs when we build.
+     Long-stable, but confirm rather than trusting memory.
+
+  The DECLINE set matters more than the success path. The most common bug
+  in a checkout system is what the order status does when payment fails -
+  stuck in PENDING forever, or stock decremented anyway.
+
+TESTING LAYERS
+
+  L1  UNIT - no network. Mock the Stripe client. Assert the Checkout
+      Session is built with correct line items, correct amount in cents,
+      correct success/cancel URLs.
+
+  L2  WEBHOOK SIGNATURE VERIFICATION. The endpoint must REJECT unsigned
+      and wrongly-signed payloads. This is the one genuinely attackable
+      surface: an unverified webhook means anyone who finds the URL can
+      POST payment.succeeded and get free products. Test the rejection
+      path deliberately, not just the accept path.
+
+  L3  WEBHOOK REPLAY / IDEMPOTENCY. Stripe retries on non-2xx and can
+      deliver the same event more than once even on success. Fire the same
+      checkout.session.completed twice; assert the order is marked PAID
+      once and stock decrements once.
+
+  L4  INTEGRATION against Stripe's real test API with sk_test_ keys.
+      Slower - keep these few, but they catch API drift that mocks never will.
+
+  L5  LOCAL END-TO-END via Stripe CLI (the workhorse):
+        stripe login
+        stripe listen --forward-to localhost:7005/webhook
+      Gives a webhook signing secret and tunnels real Stripe test events to
+      localhost. No ngrok, no public URL needed. Then either drive it in the
+      browser, or fire events directly:
+        stripe trigger checkout.session.completed
+        stripe trigger payment_intent.payment_failed
+
+  L6  MANUAL BROWSER RUN-THROUGH.
+      Cart -> checkout -> Stripe page -> 4242... -> redirect back ->
+      order shows PAID -> stock decremented.
+      Repeat with 4000 0000 0000 9995 and confirm a sensible failed state.
+
+  L7  LOAD GENERATION for the dashboards. Loop a few hundred checkouts with
+      a mix of success and decline cards so the Grafana panels have real
+      shape. A flat-line dashboard screenshot is a worse LinkedIn post than
+      one showing a success-rate dip during a decline burst.
+
+GUARDS AGAINST THE REAL-MONEY MISTAKE
+
+  - Never put sk_live_ anywhere in this project. You do not need one.
+  - .env gitignored before the first commit (Track 0).
+  - Startup assertion in payment-service: if the configured secret key does
+    not start with "sk_test_", REFUSE TO BOOT. Three lines, and the mistake
+    becomes structurally impossible.
+  - Stripe dashboard has a test/live toggle - check which one you are on.
+
+  A real card only ever enters the picture if you take this live to real
+  customers, and even then it is one small charge to yourself, immediately
+  refunded. That is not this project.
+
+
+-------------------------------------------------------------------------------
+ S7. METRICS INSTRUMENTATION
+-------------------------------------------------------------------------------
+
+TERMINOLOGY - two different things called "gauge":
+
+  Micrometer Gauge  = a METRIC TYPE. Value that goes up and down, sampled at
+                      scrape time (queue depth, in-flight count, heap bytes).
+  Grafana Gauge     = a VISUALIZATION. The dial with a needle and thresholds.
+
+  For payment failures: use COUNTERS in code, rendered IN Grafana Gauge
+  panels. Counters only go up, which is right for "number of failures", and
+  Grafana computes the rate for the dial. A Micrometer Gauge here would lose
+  data on every pod restart and could not produce rates.
+
+  Heap used/free is the opposite case - genuinely a Gauge metric, and
+  Micrometer already emits it for free.
+
+THE INSTRUMENTATION (payment-service) - one counter with tags, not many
+counters:
+
+    // Counter named "payments" - the Prometheus registry appends _total,
+    // so this surfaces as payments_total.
+    registry.counter("payments",
+        "status",   "succeeded",       // succeeded | failed
+        "reason",   "none",            // card_declined, insufficient_funds,
+        "currency", currency)          // expired_card, 3ds_failed,
+        .increment();                  // processing_error
+
+    registry.timer("payment.duration", "status", status).record(elapsed);
+
+    Gauge.builder("payments.inflight", pendingOrders, Set::size)
+         .register(registry);
+
+    registry.counter("webhook.events",
+        "type",    eventType,
+        "outcome", outcome)            // verified | bad_signature | duplicate
+        .increment();
+
+TWO GOTCHAS THAT WILL BITE
+
+  !! NAMING. Do NOT name the counter "payments_total". Micrometer appends
+     the _total suffix itself -> you get payments_total_total.
+     Name it "payments".
+
+  !! CARDINALITY. NEVER tag with orderId, customerId, or paymentIntentId.
+     Every unique tag value creates a new time series; unbounded tags will
+     bloat Prometheus until it falls over. Keep tags to small fixed sets:
+     status, reason, currency. That is all.
+
+
+-------------------------------------------------------------------------------
+ S8. TRACK 3 - GRAFANA DASHBOARD (built LOCALLY)     (~half day)
+-------------------------------------------------------------------------------
+
+  Add Prometheus + Grafana to docker-compose.yml. Build the dashboards where
+  iteration is instant, then export the JSON to k8s/grafana/dashboards/ so
+  EKS provisions them automatically instead of you rebuilding panels in the
+  cluster.
+
+  Mockup of the target layout:
+  https://claude.ai/code/artifact/48ff76aa-ef6c-415e-baf7-20d8befe4ad3
+
+PROMQL PER PANEL
+
+  Success rate (headline gauge, 0-100, thresholds red<90 amber 90-95 green>95)
+    sum(rate(payments_total{status="succeeded"}[5m]))
+      / sum(rate(payments_total[5m])) * 100
+
+  Failure rate (inverse dial)
+    sum(rate(payments_total{status="failed"}[5m]))
+      / sum(rate(payments_total[5m])) * 100
+
+  Failures per reason, side by side  [Grafana BAR GAUGE panel - one meter
+  per reason, this is the "each on its own gauge" view]
+    sum by (reason) (increase(payments_total{status="failed"}[1h]))
+
+  Failures over time, stacked by reason  [time series - shows WHEN a
+  decline burst happened]
+    sum by (reason) (rate(payments_total{status="failed"}[5m]))
+
+  Checkout p95 latency
+    histogram_quantile(0.95,
+      sum by (le) (rate(payment_duration_seconds_bucket[5m])))
+
+  Webhook signature rejections  [stat - should sit at zero; above zero
+  means a bug or someone probing the endpoint]
+    sum(increase(webhook_events_total{outcome="bad_signature"}[15m]))
+
+  Heap used %   [gauge]
+    sum(jvm_memory_used_bytes{area="heap"})
+      / sum(jvm_memory_max_bytes{area="heap"}) * 100
+
+  Free heap bytes
+    sum(jvm_memory_max_bytes{area="heap"})
+      - sum(jvm_memory_used_bytes{area="heap"})
+
+  !! ALWAYS rate() or increase(), NEVER the raw counter. Counters reset to
+     zero when a pod restarts; raw values show cliff drops that look like
+     data loss.
+
+DASHBOARD LAYOUT
+
+  Row 1 - PAYMENTS (custom, the part worth building):
+    success-rate gauge | failure-rate gauge | in-flight | failures today
+    bar gauge per failure reason | failure time series
+    p95 latency | webhook rejections | kafka consumer lag | orders paid
+
+  Row 2 - JVM & MEMORY (imported, zero custom work):
+    Import Grafana dashboard 4701 (JVM Micrometer) and 6756 (Spring Boot
+    Statistics). Metrics already emitted by micrometer-registry-prometheus.
+
+  RECOMMENDATION: put JVM in a COLLAPSED row on the same dashboard. JVM
+  panels are diagnostic noise 95% of the time - one click away, not
+  competing with payment health for attention. For a LinkedIn screenshot,
+  a dashboard leading with business metrics reads far better than one
+  leading with garbage collection.
+
+  !! Add a `service` template variable:
+       label_values(jvm_memory_used_bytes, service)
+     Otherwise the JVM row sums heap across six services and the number is
+     meaningless. (This is why 0.3 adds the service tag.)
+
+  !! Set Prometheus scrape interval to 10-15s. kube-prometheus-stack
+     defaults to 30s, which makes rate(...[5m]) sluggish and the gauges lag
+     visibly behind the demo you are recording.
+
+
+-------------------------------------------------------------------------------
+ S9. TRACK 4 - EKS                     (~1 day, TIMEBOXED)
+-------------------------------------------------------------------------------
+
+  Now the original Phase 1-4, but lifting a known-good system.
+
+  4.1  PRACTICE ON k3d OR kind LOCALLY FIRST. Free, ~30 seconds to create,
+       identical manifests. Get the manifests right before paying for EKS.
+  4.2  eksctl create cluster (2 x t3.medium managed node group)
+  4.3  ECR repos; build + push all 6 images.
+       !! Tag by git SHA, never `latest`. With `latest`, Kubernetes cannot
+          tell that the image changed and rollouts silently do nothing.
+  4.4  Manifests: Deployment + Service per microservice, ConfigMaps,
+       Secrets for Stripe keys, StatefulSets for MongoDB and MySQL
+  4.5  KAFKA VIA STRIMZI OPERATOR (in-cluster, free) rather than Amazon MSK
+       (roughly $150/mo - not worth it for a demo)
+  4.6  AWS Load Balancer Controller + Ingress -> one public URL
+  4.7  Point the Stripe webhook at that public URL; re-verify checkout
+       end to end in the cluster
+  4.8  kube-prometheus-stack Helm chart, ServiceMonitors, import the
+       dashboard JSON saved in Track 3
+
+  !!!! COST - READ THIS BEFORE STARTING
+       EKS control plane is ~$0.10/hour (~$73/month) WHETHER OR NOT
+       anything runs on it. Plus nodes, NAT gateway, and the ELB.
+       Realistically $5-8/day.
+
+       - SET A BILLING ALARM BEFORE `eksctl create cluster`.
+       - Do this phase in ONE FOCUSED BURST.
+       - Capture screenshots and screen recordings while it is up.
+       - `eksctl delete cluster` THE SAME DAY.
+       - Verify current pricing yourself - these are ballpark figures.
+
+  !! Databases as StatefulSets with emptyDir lose data on pod restart.
+     Fine for a demo - but call it out explicitly in the write-up rather
+     than letting a reviewer catch it.
+
+
+-------------------------------------------------------------------------------
+ S10. TRACK 5 - LINKEDIN SHOWCASE              (~half day)
+-------------------------------------------------------------------------------
+
+  RECORD THE DEMO WHILE THE CLUSTER IS ALIVE - Track 4 is the window you
+  are paying for. Do not tear down before capturing.
+
+  The demo run:
+    browse products -> add to cart -> checkout -> Stripe test card 4242 ->
+    redirect back -> order flips to PAID -> Grafana panels move in real time
+
+  Assets:
+    - Architecture diagram (build from the existing MyComp.puml / MySeq.puml)
+    - 3-4 dashboard screenshots (one showing the decline burst)
+    - Short screen recording of the end-to-end flow
+
+  Write the post around the PROBLEM the event-driven design solves, not a
+  list of technologies. "Checkout shouldn't block on inventory" is a hook.
+  "Built with Spring Boot, Kafka, Kubernetes, Prometheus" is not.
+
+
+-------------------------------------------------------------------------------
+ S11. OPEN DECISIONS - NEEDED BEFORE IMPLEMENTATION STARTS
+-------------------------------------------------------------------------------
+
+  D1. CART LOCATION
+      [ ] localStorage only            (RECOMMENDED - saves ~1 day, no auth
+                                        needed; cart does not cross devices)
+      [ ] Dedicated cart-service       (Redis/Mongo; needs a user identity
+                                        that does not exist yet)
+
+  D2. USER-SERVICE / AUTH
+      [ ] Skip for now                 (RECOMMENDED - anonymous checkout,
+                                        Stripe collects the email)
+      [ ] Build it now                 (closes the Level 0 gap from
+                                        poc-requirement.md; adds 1-2 days
+                                        BEFORE any payment work starts)
+
+  D3. SEQUENCING
+      [ ] Local-first, then EKS burst  (RECOMMENDED - see S2)
+      [ ] Original order, EKS first
+
+  D4. WHERE TO START
+      [ ] Track 0 - foundation         (RECOMMENDED - ~2h, unblocks all)
+      [ ] Track 1 - Kafka first
+      [ ] Track 2 - Stripe first
+      [ ] Plan review only, no code yet
+
+
+-------------------------------------------------------------------------------
+ S12. TRACK SUMMARY
+-------------------------------------------------------------------------------
+
+  TRACK  NAME                          EFFORT      BLOCKS
+  -----  ----------------------------  ----------  ---------------------------
+  0      Foundation                    ~2 hours    EVERYTHING
+  1      Kafka + event-driven          ~1 day      Track 2 event flow
+  2      Cart + Checkout + Stripe      ~2 days     Track 3 payment panels
+  3      Local observability           ~half day   Track 4 dashboard import
+  4      EKS (timeboxed, costs money)  ~1 day      Track 5 recording
+  5      LinkedIn showcase             ~half day   -
+                                       ----------
+                                       5-7 days
+
+  DEPENDENCY CHAIN
+    Track 0 ---> Track 1 ---> Track 2 ---> Track 3 ---> Track 4 ---> Track 5
+       |                         |            |
+       +-- git, images,          |            +-- dashboard JSON exported
+           metrics endpoint      |                here, imported in 4.8
+                                 +-- 2.7 instrumentation is what makes
+                                     the Track 3 panels non-empty
+
+===============================================================================
+ END OF PLAN
+===============================================================================
