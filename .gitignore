@@ -1,0 +1,27 @@
+# --- Build output ---
+build/
+bin/
+out/
+
+# --- Gradle ---
+.gradle/
+
+# --- Node ---
+node_modules/
+dist/
+
+# --- IDE metadata ---
+.settings/
+.project
+.classpath
+.idea/
+*.iml
+
+# --- Archives / local env ---
+backend.zip
+.env
+.env.*
+
+# --- OS noise ---
+Thumbs.db
+.DS_Store
