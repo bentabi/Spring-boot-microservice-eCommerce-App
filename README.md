@@ -1,4 +1,9 @@
 # cns-romania-readme
+
+> **[Architecture & Roadmap](ARCHITECTURE-AND-ROADMAP.md)** — current system, endpoints, test suite,
+> architectural diagrams, and the end-to-end plan through Kafka, Stripe checkout, Grafana monitoring
+> and EKS. Start there.
+
 #### Introducing the microservice landscape
 
 **Design Patterns for Microservices**
